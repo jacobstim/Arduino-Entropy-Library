@@ -20,8 +20,18 @@
 //
 // You should have received a copy of the GNU General Public License
 // along with Entropy.  If not, see <http://www.gnu.org/licenses/>.
+//
+// ---------------------------------------------------------------------------
+// Note:
+//  - uses TRNG hardware module on Arduino Due (SAM3X8E)
+//  - uses jitter between main CPU oscillator and timer oscillator (32.768kHz)
+//    on Arduino AVR and SAMD21
+// ---------------------------------------------------------------------------
+// Additions by Tim Jacobs: SAMD21 compatibility for Arduino Zero/MKR1000/MKR1200/...
+// and similar boards (Adafruit Feather M0, Sparkfun SAMD21 Dev board, ...)
 
-#include <Entropy.h>
+
+#include "Entropy.h"
 
 const uint8_t WDT_MAX_8INT=0xFF;
 const uint16_t WDT_MAX_16INT=0xFFFF;
@@ -39,10 +49,15 @@ const uint32_t WDT_MAX_32INT=0xFFFFFFFF;
  volatile uint32_t gWDT_entropy_pool[WDT_POOL_SIZE];
 #endif
 
+volatile uint32_t _tickcounter;
+
+
 // This function initializes the global variables needed to implement the circular entropy pool and
 // the buffer that holds the raw Timer 1 values that are used to create the entropy pool.  It then
-// Initializes the Watch Dog Timer (WDT) to perform an interrupt every 2048 clock cycles, (about
-// 16 ms) which is as fast as it can be set.
+// Initializes the Watch Dog Timer (WDT) to perform an interrupt 
+//  - AVR hardware: every 2048 clock cycles, (about 16 ms) which is as fast as it can be set.
+//  - SAMD21 hardware: every 1ms (1kHz clock)
+//
 void EntropyClass::initialize(void)
 {
 #ifndef ARDUINO_SAM_DUE
@@ -69,7 +84,78 @@ void EntropyClass::initialize(void)
   LPTMR0_CMR = 0x0006;      // smaller number = faster random numbers...
   LPTMR0_CSR = 0b01000101;
   NVIC_ENABLE_IRQ(IRQ_LPTMR);
+#elif defined(ARDUINO_ARCH_SAMD)
+  _tickcounter = 0;
+  /************************************************************************************************
+    We are going to configure a timer on the SAMD21, with the following properties:
+     - Clock Source: low power 32KHz oscillator 
+     - Count up until value 1 is exceeded
+     - Clock Divider: 16, so the counter overflows every 1/1024s
+       => Once the counter reaches 2, we overflow, so the effective clock divider is 32
+          (two counts per interrupt).
+    This means that approximately every 1ms, our timer interrupt routine will be called; since
+    our main clockfrequency is 48MHz, we expect SYSTICK to increase by 1464 at every 32KHz 
+    oscillator tick (48.000.000/32.768), or with 1.500.000 every 1024 32KHz oscillator ticks. 
+    Due to the thermal influences on both crystals, this number will be slightly different every 
+    time, and that will be our source of randomness. 
+
+    Some inspiration from: https://github.com/nebs/arduino-zero-timer-demo/blob/master/src/main.cpp
+   ************************************************************************************************/
+  // We choose a general clock generator... let's take number 2, and configure divisor = 16.
+  // Since the actual divider is calculated as (2^(DIV+1)), we take DIV = 3, so we have 2^4 = 16 
+  // as actual divider.
+  GCLK->GENDIV.reg = GCLK_GENDIV_ID(2) | GCLK_GENDIV_DIV(3);
+  // Enable clock generator 2 (GCLK2) using low-power 32KHz oscillator.
+  GCLK->GENCTRL.reg = GCLK_GENCTRL_ID(2) |                  // Clock generator ID 2
+                      GCLK_GENCTRL_GENEN |                  // Enable generator
+                      GCLK_GENCTRL_SRC_OSCULP32K |          // Use low power 32KHz oscillator as source
+                      GCLK_GENCTRL_DIVSEL;                  // The generic clock generator equals the clock source divided by 2^(GENDIV.DIV+1)
+  // Wait for changes to process
+  while(GCLK->STATUS.bit.SYNCBUSY);
+
+  // Feed GCLK2 to TC4 (and TC5, they work together)
+  GCLK->CLKCTRL.reg = GCLK_CLKCTRL_ID_TC4_TC5 |             // Control Timer4 and Timer5
+                      GCLK_CLKCTRL_CLKEN |                  // Enable the coupling
+                      GCLK_CLKCTRL_GEN_GCLK2;               // Couple GCLK2 to TC4
+
+  // Wait for changes to process
+  while (GCLK->STATUS.bit.SYNCBUSY);
+
+  // Configure Timer 4
+  TcCount16* TC = (TcCount16*) TC4;
+  TC->CTRLA.reg &= ~TC_CTRLA_ENABLE;                        // Disable Timer4 if running
+  TC->CTRLA.reg |= TC_CTRLA_MODE_COUNT16;                   // Use the 16-bit timer
+  while (TC->STATUS.bit.SYNCBUSY == 1);
+  TC->CTRLA.reg |= TC_CTRLA_WAVEGEN_MFRQ;                   // Count up until the configured value
+  while (TC->STATUS.bit.SYNCBUSY == 1);
+  TC->CTRLA.reg |= TC_CTRLA_PRESCALER_DIV1;                 // Set prescaler to 1
+
+  // Initialize Timer 4
+  TC->COUNT.reg = 0;                                        // Set starting count value 
+  TC->CC[0].reg = 1;                                        // Count up to this value (at a rate of 1 per clock tick = 1 per 1/1024 of a second)
+  while (TC->STATUS.bit.SYNCBUSY == 1);
+  TC->INTENSET.reg = 0;                                     
+  TC->INTENSET.bit.MC0 = 1;                                 // Enable compare with CC[0]
+
+  // Enable the TC4 interrupt function
+  NVIC_DisableIRQ(TC4_IRQn);                                // Disable existing interrupt
+  NVIC_ClearPendingIRQ(TC4_IRQn);                           // Clear pending interrupts
+  NVIC_SetPriority(TC4_IRQn, 0);                            // Give TC4 the top priority in the Nested Vector Interrupt Controller (NVIC)
+  NVIC_EnableIRQ(TC4_IRQn);                                 // Connect TC4 to the NVIC
+
+  // Enable counter
+  TC->CTRLA.reg |= TC_CTRLA_ENABLE;                         // Enabler timer again
+  while (TC->STATUS.bit.SYNCBUSY == 1);
+
 #endif
+}
+
+
+// This function returns the current number of clockticks by our external reference
+// clock. You might find it useful for various reasons.
+// NOTE: Does not work on Arduino Due, it uses a TRNG instead of a timer implementation
+uint32_t EntropyClass::getTicks() {
+  return _tickcounter;
 }
 
 // This function returns a uniformly distributed random integer in the range
@@ -80,10 +166,29 @@ void EntropyClass::initialize(void)
 // The pool is implemented as an 8 value circular buffer
 uint32_t EntropyClass::random(void)
 {
-#ifdef ARDUINO_SAM_DUE
+  uint32_t retVal = 0;
+#if defined(ARDUINO_SAM_DUE)
   while (! (TRNG->TRNG_ISR & TRNG_ISR_DATRDY))
     ;
   retVal = TRNG->TRNG_ODATA;
+#elif defined(__SAMD21G18A__)
+  uint8_t waiting = 0;
+  // Wait at most 1 second...
+  while ((gWDT_pool_count < 1) && (waiting < 100)) {
+    waiting += 1;
+    delay(10);
+  }
+
+  // Did we time out in the above loop?
+  if (waiting < 100) {
+    // The following code needs to be executed atomically, i.e. without our timer interrupt interfering!
+    noInterrupts();             // platform independent Arduino framework implementation
+    retVal = gWDT_entropy_pool[gWDT_pool_start];
+    gWDT_pool_start = (gWDT_pool_start + 1) % WDT_POOL_SIZE;
+    --gWDT_pool_count;
+    interrupts();               // platform independent Arduino framework implementation
+  }
+
 #else
   uint8_t waiting;
   while (gWDT_pool_count < 1)
@@ -95,7 +200,7 @@ uint32_t EntropyClass::random(void)
     --gWDT_pool_count;
   }
 #endif
-  return(retVal);
+  return retVal;
 }
 
 // This function returns one byte of a single 32-bit entropy value, while preserving the remaining bytes to
@@ -163,23 +268,23 @@ uint32_t EntropyClass::random(uint32_t max)
     {
       retVal = WDT_MAX_32INT;
       if (max <= WDT_MAX_8INT) // If only byte values are needed, make best use of entropy
-	{                      // by diving the long into four bytes and using individually
-	  slice = WDT_MAX_8INT / max;
-	  while (retVal >= max)
-	    retVal = random8() / slice;
-	}
+      {                      // by diving the long into four bytes and using individually
+        slice = WDT_MAX_8INT / max;
+        while (retVal >= max)
+          retVal = random8() / slice;
+      }
       else if (max <= WDT_MAX_16INT) // If only word values are need, make best use of entropy
-	{                            // by diving the long into two words and using individually
-	  slice = WDT_MAX_16INT / max;
-	  while (retVal >= max)
-	    retVal = random16() / slice;
-	}
+      {                            // by diving the long into two words and using individually
+        slice = WDT_MAX_16INT / max;
+        while (retVal >= max)
+          retVal = random16() / slice;
+      }
       else
-	{
-	  slice = WDT_MAX_32INT / max;
-	  while (retVal >= max)
-	    retVal = random() / slice;
-	}
+      {
+        slice = WDT_MAX_32INT / max;
+        while (retVal >= max)
+          retVal = random() / slice;
+      }
     }
   return(retVal);
 }
@@ -320,21 +425,40 @@ static void isr_hardware_neutral(uint8_t val)
 #if defined( __AVR_ATtiny25__ ) || defined( __AVR_ATtiny45__ ) || defined( __AVR_ATtiny85__ )
 ISR(WDT_vect)
 {
-  isr_hardware_neutral(TCNT0);
+ _tickcounter++;
+ isr_hardware_neutral(TCNT0);
 }
 
 #elif defined(__AVR__)
 ISR(WDT_vect)
 {
+  _tickcounter++;
   isr_hardware_neutral(TCNT1L); // Record the Timer 1 low byte (only one needed)
 }
 
 #elif defined(__arm__) && defined(TEENSYDUINO)
 void lptmr_isr(void)
 {
+  _tickcounter++;
   LPTMR0_CSR = 0b10000100;
   LPTMR0_CSR = 0b01000101;
   isr_hardware_neutral(SYST_CVR);
+}
+#elif defined(__SAMD21G18A__)
+// Interrupt Service Routine (ISR) for timer TC4
+void TC4_Handler()                              
+{     
+  TcCount16* TC = (TcCount16*) TC4;
+  if (TC->INTFLAG.bit.MC0 == 1) {
+    // Our tick counter for reference purposes
+    _tickcounter++;
+
+    // Timer reached max count, store current SYSTICK value for randomness
+    isr_hardware_neutral(SysTick->VAL);
+
+    // Writing a 1 again clears the flag interrupt
+    TC->INTFLAG.bit.MC0 = 1;
+   }
 }
 #endif
 

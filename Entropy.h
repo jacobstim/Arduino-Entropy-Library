@@ -19,6 +19,7 @@
 #ifndef Entropy_h
 #define Entropy_h
 
+#include <Arduino.h>
 #include <string.h>
 #include <math.h>
 
@@ -64,7 +65,9 @@ public:
   float randomf(float min, float max);
   float rnorm(float mean, float stdDev);
   uint8_t available(void);
- private:
+  uint32_t getTicks();
+
+private:
   ENTROPY_LONG_WORD share_entropy;
   uint32_t retVal;
   uint8_t random8(void);
